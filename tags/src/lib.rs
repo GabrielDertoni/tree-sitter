@@ -8,9 +8,10 @@ use std::ops::Range;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{char, mem, str};
+use std::borrow::Cow;
 use thiserror::Error;
 use tree_sitter::{
-    Language, LossyUtf8, Parser, Point, Query, QueryCursor, QueryError, QueryPredicateArg, Tree,
+    Language, LossyUtf8, Parser, Point, Query, QueryCursor, QueryError, QueryPredicateArg, Tree, TextProvider,
 };
 
 const MAX_LINE_LEN: usize = 180;
@@ -81,7 +82,7 @@ struct PatternInfo {
 
 #[derive(Debug)]
 struct LocalDef<'a> {
-    name: &'a [u8],
+    name: Cow<'a, [u8]>,
 }
 
 #[derive(Debug)]
@@ -91,13 +92,16 @@ struct LocalScope<'a> {
     local_defs: Vec<LocalDef<'a>>,
 }
 
-struct TagsIter<'a, I>
+struct TagsIter<'a, T, I>
 where
-    I: Iterator<Item = tree_sitter::QueryMatch<'a, 'a>>,
+    I: Iterator<Item = tree_sitter::QueryMatch<'a, 'a>> + 'a,
+    T: TextProvider<'a> + 'a,
 {
     matches: I,
-    _tree: Tree,
-    source: &'a [u8],
+    // When `_tree` is `Some`, it means a `Tree` was created in order to construct the `TagsIter`. If
+    // it is `None`, the `Tree` was borrowed and has lifetime `'a`.
+    _tree: Option<Tree>,
+    source: T,
     prev_line_info: Option<LineInfo>,
     config: &'a TagsConfiguration,
     cancellation_flag: Option<&'a AtomicUsize>,
@@ -277,7 +281,7 @@ impl TagsContext {
             .matches(&config.query, tree_ref.root_node(), source);
         Ok((
             TagsIter {
-                _tree: tree,
+                _tree: Some(tree),
                 matches,
                 source,
                 config,
@@ -294,15 +298,65 @@ impl TagsContext {
             tree_ref.root_node().has_error(),
         ))
     }
+
+    pub fn generate_tags_from_tree<'a, T: TextProvider<'a> + Clone + 'a>(
+        &'a mut self,
+        config: &'a TagsConfiguration,
+        tree: &'a Tree,
+        source: T,
+        cancellation_flag: Option<&'a AtomicUsize>,
+    ) -> impl Iterator<Item = Result<Tag, Error>> + 'a {
+
+        let matches = self
+            .cursor
+            .matches(&config.query, tree.root_node(), source.clone());
+
+        TagsIter {
+            _tree: None,
+            matches,
+            source,
+            config,
+            cancellation_flag,
+            prev_line_info: None,
+            tag_queue: Vec::new(),
+            iter_count: 0,
+            scopes: vec![LocalScope {
+                range: tree.root_node().byte_range(),
+                inherits: false,
+                local_defs: Vec::new(),
+            }],
+        }
+    }
 }
 
-impl<'a, I> Iterator for TagsIter<'a, I>
+impl<'a, T, I> Iterator for TagsIter<'a, T, I>
 where
     I: Iterator<Item = tree_sitter::QueryMatch<'a, 'a>>,
+    T: TextProvider<'a> + 'a,
 {
     type Item = Result<Tag, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        fn get_text<'a, 'b: 'a, I: Iterator<Item = &'b [u8]>>(
+            buffer: &'a mut Vec<u8>,
+            mut chunks: I,
+        ) -> &'a [u8] {
+            let first_chunk = chunks.next().unwrap_or(&[]);
+            if let Some(next_chunk) = chunks.next() {
+                buffer.clear();
+                buffer.extend_from_slice(first_chunk);
+                buffer.extend_from_slice(next_chunk);
+                for chunk in chunks {
+                    buffer.extend_from_slice(chunk);
+                }
+                buffer.as_slice()
+            } else {
+                first_chunk
+            }
+        }
+
+        let mut buf = Vec::new();
+
         loop {
             // Periodically check for cancellation, returning `Cancelled` error if the
             // cancellation flag was flipped.
@@ -350,9 +404,21 @@ where
                             if let Some(scope) = self.scopes.iter_mut().rev().find(|scope| {
                                 scope.range.start <= range.start && scope.range.end >= range.end
                             }) {
-                                scope.local_defs.push(LocalDef {
-                                    name: &self.source[range.clone()],
-                                });
+                                let mut it = self.source.text(capture.node).peekable();
+                                let name = match it.next() {
+                                    Some(slice) => match it.next() {
+                                        Some(slice2) => {
+                                            let mut vec = Vec::new();
+                                            vec.extend_from_slice(slice);
+                                            vec.extend_from_slice(slice2);
+                                            vec.extend(it.flatten());
+                                            Cow::Owned(vec)
+                                        }
+                                        None => Cow::Borrowed(slice),
+                                    },
+                                    None => Cow::Borrowed(&[] as &'static [_]),
+                                };
+                                scope.local_defs.push(LocalDef { name });
                             }
                         }
                     }
@@ -403,6 +469,7 @@ where
 
                         if pattern_info.name_must_be_non_local {
                             let mut is_local = false;
+                            let source = &mut self.source;
                             for scope in self.scopes.iter().rev() {
                                 if scope.range.start <= name_range.start
                                     && scope.range.end >= name_range.end
@@ -410,7 +477,7 @@ where
                                     if scope
                                         .local_defs
                                         .iter()
-                                        .any(|d| d.name == &self.source[name_range.clone()])
+                                        .any(|d| d.name.as_ref() == get_text(&mut buf, source.text(name_node)))
                                     {
                                         is_local = true;
                                         break;
@@ -448,7 +515,7 @@ where
                         // Generate a doc string from all of the doc nodes, applying any strip regexes.
                         let mut docs = None;
                         for doc_node in &doc_nodes[docs_start_index..] {
-                            if let Ok(content) = str::from_utf8(&self.source[doc_node.byte_range()])
+                            if let Ok(content) = str::from_utf8(&get_text(&mut buf, self.source.text(*doc_node)))
                             {
                                 let content = if let Some(regex) = &pattern_info.doc_strip_regex {
                                     regex.replace_all(content, "").to_string()
@@ -489,17 +556,19 @@ where
                             }
                         } else {
                             line_range = self::line_range(
-                                self.source,
+                                get_text(&mut buf, self.source.text(name_node)),
                                 name_range.start,
                                 span.start,
                                 MAX_LINE_LEN,
                             );
                         }
 
-                        let utf16_start_column = prev_utf16_column
-                            + utf16_len(&self.source[prev_utf8_byte..name_range.start]);
+                        // FIXME
+                        // let utf16_start_column = prev_utf16_column
+                            // + utf16_len(&self.source[prev_utf8_byte..name_range.start]);
+                        let utf16_start_column = name_range.start - prev_utf8_byte;
                         let utf16_end_column =
-                            utf16_start_column + utf16_len(&self.source[name_range.clone()]);
+                            utf16_start_column + utf16_len(get_text(&mut buf, self.source.text(name_node)));
                         let utf16_column_range = utf16_start_column..utf16_end_column;
 
                         self.prev_line_info = Some(LineInfo {
