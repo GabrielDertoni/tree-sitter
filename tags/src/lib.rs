@@ -50,6 +50,7 @@ pub struct TagsContext {
 pub struct Tag {
     pub range: Range<usize>,
     pub name_range: Range<usize>,
+    pub name: String,
     pub line_range: Range<usize>,
     pub span: Range<Point>,
     pub utf16_column_range: Range<usize>,
@@ -460,6 +461,7 @@ where
 
                 if let Some(name_node) = name_node {
                     let name_range = name_node.byte_range();
+                    let name = String::from_utf8(get_text(&mut buf, self.source.text(name_node)).to_owned()).unwrap();
 
                     let tag;
                     if let Some(tag_node) = tag_node {
@@ -578,6 +580,7 @@ where
                             utf16_column_range,
                             range,
                             name_range,
+                            name,
                             docs,
                             is_definition,
                             syntax_type_id,
@@ -619,6 +622,7 @@ impl Tag {
     fn ignored(name_range: Range<usize>) -> Self {
         Tag {
             name_range,
+            name: String::new(),
             line_range: 0..0,
             span: Point::new(0, 0)..Point::new(0, 0),
             utf16_column_range: 0..0,
