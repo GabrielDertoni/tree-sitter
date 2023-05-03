@@ -555,12 +555,7 @@ where
                                 prev_utf16_column = line_info.utf16_column;
                             }
                         } else {
-                            line_range = self::line_range(
-                                get_text(&mut buf, self.source.text(name_node)),
-                                name_range.start,
-                                span.start,
-                                MAX_LINE_LEN,
-                            );
+                            line_range = 0..0;
                         }
 
                         // FIXME
